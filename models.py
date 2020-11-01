@@ -1,3 +1,4 @@
+# done editing
 from __future__ import division
 
 import torch
@@ -12,9 +13,128 @@ from utils.parse_config import *
 from utils.utils import build_targets
 from collections import defaultdict
 
-##import matplotlib.pyplot as plt
-##import matplotlib.patches as patches
+from os.path import join, dirname, isfile
+import tqdm
 
+
+# processing event tensor
+
+class ValueLayer(nn.Module):
+    def __init__(self, mlp_layers, activation=nn.ReLU(), num_channels=9):
+        assert mlp_layers[-1] == 1, "Last layer of the mlp must have 1 input channel."
+        assert mlp_layers[0] == 1, "First layer of the mlp must have 1 output channel"
+
+        nn.Module.__init__(self)
+        self.mlp = nn.ModuleList()
+        self.activation = activation
+
+        # create mlp
+        in_channels = 1
+        for out_channels in mlp_layers[1:]:
+            self.mlp.append(nn.Linear(in_channels, out_channels))
+            in_channels = out_channels
+
+        # init with trilinear kernel
+        path = join(dirname(__file__), "quantization_layer_init", "trilinear_init.pth")
+        if isfile(path):
+            state_dict = torch.load(path)
+            self.load_state_dict(state_dict)
+        else:
+            self.init_kernel(num_channels)
+
+    def forward(self, x):
+        # create sample of batchsize 1 and input channels 1
+        x = x[None,...,None]
+
+        # apply mlp convolution
+        for i in range(len(self.mlp[:-1])):
+            x = self.activation(self.mlp[i](x))
+
+        x = self.mlp[-1](x)
+        x = x.squeeze()
+
+        return x
+
+    def init_kernel(self, num_channels):
+        ts = torch.zeros((1, 2000))
+        optim = torch.optim.Adam(self.parameters(), lr=1e-2)
+
+        torch.manual_seed(1)
+
+        for _ in tqdm.tqdm(range(1000)):  # converges in a reasonable time
+            optim.zero_grad()
+
+            ts.uniform_(-1, 1)
+
+            # gt
+            gt_values = self.trilinear_kernel(ts, num_channels)
+
+            # pred
+            values = self.forward(ts)
+
+            # optimize
+            loss = (values - gt_values).pow(2).sum()
+
+            loss.backward()
+            optim.step()
+
+
+    def trilinear_kernel(self, ts, num_channels):
+        gt_values = torch.zeros_like(ts)
+
+        gt_values[ts > 0] = (1 - (num_channels-1) * ts)[ts > 0]
+        gt_values[ts < 0] = ((num_channels-1) * ts + 1)[ts < 0]
+
+        gt_values[ts < -1.0 / (num_channels-1)] = 0
+        gt_values[ts > 1.0 / (num_channels-1)] = 0
+
+        return gt_values
+
+
+class QuantizationLayer(nn.Module):
+    def __init__(self, dim,
+                 mlp_layers=[1, 100, 100, 1],
+                 activation=nn.LeakyReLU(negative_slope=0.1)):
+        nn.Module.__init__(self)
+        self.value_layer = ValueLayer(mlp_layers,
+                                      activation=activation,
+                                      num_channels=dim[0])
+        self.dim = dim
+        self.conv_layer = nn.Conv2d(9, 3, kernel_size=1, stride=1, bias=False)
+
+    # event numpy array (x, y, t, p) shape (_, 4)
+    def forward(self, events):
+        # points is a list, since events can have any size
+        num_voxels = int(np.prod(self.dim))
+        vox = events[0].new_full([num_voxels,], fill_value=0)
+        C, H, W = self.dim
+
+        all_vox=np.zeros([])
+
+        B = len(events)
+        all_vox = torch.zeros([B,C,H,W])
+        for b in range(B):
+            # get values for each channel
+            x, y, t, p = events[b].t() # transpose
+            # p is composed of only ones
+            # normalizing timestamps
+            t = (t-t.min()) / t.max()
+            idx_before_bins = x + W * y
+            for i_bin in range(C):
+                values = t * self.value_layer.forward(t-i_bin/(C-1))
+                # draw in voxel grid
+                idx = idx_before_bins + W * H * i_bin
+                vox.put_(idx.long(), values, accumulate=True)
+            vox = vox.view(C, H, W)
+            all_vox[b,:,:,:] = vox
+
+        all_vox = F.interpolate(all_vox, size=(416,416))
+        # print(all_vox.shape)
+        v = self.conv_layer(all_vox)
+        # print(v.shape)
+        return v
+
+# the yolo model
 
 def create_modules(module_defs):
     """
@@ -23,8 +143,20 @@ def create_modules(module_defs):
     hyperparams = module_defs.pop(0)
     output_filters = [int(hyperparams["channels"])]
     module_list = nn.ModuleList()
+
     for i, module_def in enumerate(module_defs):
         modules = nn.Sequential()
+
+        if module_def["type"] == "quantization":
+            voxel_dimension=[int(x) for x in module_def["voxel_dimension"].split(",")]
+            mlp_layers=[int(x) for x in module_def["mlp_layers"].split(",")]
+            activation=nn.LeakyReLU(negative_slope=float(module_def["activation"]))
+            quantization_layer = QuantizationLayer(voxel_dimension, mlp_layers, activation)
+            modules.add_module("quantization_%d" % i, quantization_layer)
+            # filters = int(module_def["filters"])
+            module_list.append(modules)
+            continue
+
 
         if module_def["type"] == "convolutional":
             bn = int(module_def["batch_normalize"])
@@ -232,7 +364,10 @@ class YOLOLayer(nn.Module):
 class Darknet(nn.Module):
     """YOLOv3 object detection model"""
 
-    def __init__(self, config_path, img_size=416):
+    def __init__(self, 
+                 config_path, 
+                 img_size=416):
+
         super(Darknet, self).__init__()
         self.module_defs = parse_model_config(config_path)
         self.hyperparams, self.module_list = create_modules(self.module_defs)
@@ -247,7 +382,9 @@ class Darknet(nn.Module):
         self.losses = defaultdict(float)
         layer_outputs = []
         for i, (module_def, module) in enumerate(zip(self.module_defs, self.module_list)):
-            if module_def["type"] in ["convolutional", "upsample", "maxpool"]:
+            if module_def["type"] in ["quantization"]:
+                x = module(x)
+            elif module_def["type"] in ["convolutional", "upsample", "maxpool"]:
                 x = module(x)
             elif module_def["type"] == "route":
                 layer_i = [int(x) for x in module_def["layers"].split(",")]
@@ -266,6 +403,8 @@ class Darknet(nn.Module):
                     x = module(x)
                 output.append(x)
             layer_outputs.append(x)
+            # print(module)
+            # print(x.shape)
 
         self.losses["recall"] /= 3
         self.losses["precision"] /= 3
@@ -273,6 +412,7 @@ class Darknet(nn.Module):
 
     def load_weights(self, weights_path):
         """Parses and loads the weights stored in 'weights_path'"""
+        # loads from second conv layer
 
         # Open the weights file
         fp = open(weights_path, "rb")
@@ -285,6 +425,8 @@ class Darknet(nn.Module):
         weights = np.fromfile(fp, dtype=np.float32)  # The rest are weights
         fp.close()
 
+        free_layers={1:True, 82:True, 94:True, 106:True}
+
         ptr = 0
         for i, (module_def, module) in enumerate(zip(self.module_defs, self.module_list)):
             if module_def["type"] == "convolutional":
@@ -295,30 +437,36 @@ class Darknet(nn.Module):
                     num_b = bn_layer.bias.numel()  # Number of biases
                     # Bias
                     bn_b = torch.from_numpy(weights[ptr : ptr + num_b]).view_as(bn_layer.bias)
-                    bn_layer.bias.data.copy_(bn_b)
+                    if i in free_layers == False:
+                        bn_layer.bias.data.copy_(bn_b)
                     ptr += num_b
                     # Weight
                     bn_w = torch.from_numpy(weights[ptr : ptr + num_b]).view_as(bn_layer.weight)
-                    bn_layer.weight.data.copy_(bn_w)
+                    if i in free_layers == False:
+                        bn_layer.weight.data.copy_(bn_w)
                     ptr += num_b
                     # Running Mean
                     bn_rm = torch.from_numpy(weights[ptr : ptr + num_b]).view_as(bn_layer.running_mean)
-                    bn_layer.running_mean.data.copy_(bn_rm)
+                    if i in free_layers == False:
+                        bn_layer.running_mean.data.copy_(bn_rm)
                     ptr += num_b
                     # Running Var
                     bn_rv = torch.from_numpy(weights[ptr : ptr + num_b]).view_as(bn_layer.running_var)
-                    bn_layer.running_var.data.copy_(bn_rv)
+                    if i in free_layers == False:
+                        bn_layer.running_var.data.copy_(bn_rv)
                     ptr += num_b
                 else:
                     # Load conv. bias
                     num_b = conv_layer.bias.numel()
                     conv_b = torch.from_numpy(weights[ptr : ptr + num_b]).view_as(conv_layer.bias)
-                    conv_layer.bias.data.copy_(conv_b)
+                    if i in free_layers == False:
+                        conv_layer.bias.data.copy_(conv_b)
                     ptr += num_b
                 # Load conv. weights
                 num_w = conv_layer.weight.numel()
                 conv_w = torch.from_numpy(weights[ptr : ptr + num_w]).view_as(conv_layer.weight)
-                conv_layer.weight.data.copy_(conv_w)
+                if i in free_layers == False:
+                    conv_layer.weight.data.copy_(conv_w)
                 ptr += num_w
 
     """
